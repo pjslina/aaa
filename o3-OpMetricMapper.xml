@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+
+<mapper namespace="org.example.mapper.OpMetricMapper">
+
+    <!-- 1? 指标列表，含度量 -->
+    <resultMap id="OpMetricWithMeasureMap" type="org.example.dto.OpMetric">
+        <id property="metricId" column="metric_id"/>
+        <result property="metricCode" column="metric_code"/>
+        <result property="metricName" column="metric_name"/>
+        <result property="currency" column="currency"/>
+
+        <collection property="measures" ofType="org.example.dto.OpMeasure">
+            <id property="id" column="measure_id"/>
+            <result property="measureCode" column="measure_code"/>
+            <result property="enName" column="en_name"/>
+            <result property="cnName" column="cn_name"/>
+            <result property="unit" column="unit"/>
+            <result property="fixedValue" column="fixed_value"/>
+        </collection>
+    </resultMap>
+
+    <select id="selectMetricsWithMeasures" resultMap="OpMetricWithMeasureMap">
+        SELECT
+            m.metric_id,
+            m.metric_code,
+            m.metric_name,
+            m.currency,
+            ms.id AS measure_id,
+            ms.measure_code,
+            ms.en_name,
+            ms.cn_name,
+            ms.unit,
+            ms.fixed_value
+        FROM op_metric m
+        LEFT JOIN op_metric_rel r ON r.metric_id = m.metric_id AND r.rel_type = 3
+        LEFT JOIN op_measure ms ON r.rel_id = ms.id
+    </select>
+
+    <!-- 2? Map<String,String> -->
+    <select id="selectMetricMeasureMap" resultType="java.util.Map">
+        SELECT
+            CONCAT(m.metric_code, ms.measure_code) AS "key",
+            ms.measure_code AS "value"
+        FROM op_metric m
+        JOIN op_metric_rel r ON r.metric_id = m.metric_id AND r.rel_type = 3
+        JOIN op_measure ms ON r.rel_id = ms.id
+    </select>
+
+    <!-- 3? 查询 domainCodes -->
+    <select id="selectMetricDomainCodes" resultType="java.util.Map">
+        SELECT m.metric_id AS metricId, d.domain_code AS domainCode
+        FROM op_metric m
+        LEFT JOIN op_metric_rel r ON r.metric_id = m.metric_id AND r.rel_type = 1
+        LEFT JOIN op_metric_domain d ON r.rel_id = d.id
+    </select>
+
+    <!-- 3? 查询 orgLevels -->
+    <select id="selectMetricOrgLevels" resultType="java.util.Map">
+        SELECT m.metric_id AS metricId, o.org_level AS orgLevel
+        FROM op_metric m
+        LEFT JOIN op_metric_rel r ON r.metric_id = m.metric_id AND r.rel_type = 2
+        LEFT JOIN op_metric_org o ON r.rel_id = o.id
+    </select>
+
+</mapper>
