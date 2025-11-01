@@ -1449,3 +1449,808 @@ logging:
 支持定时任务：实现ITimerTask
 
 这个方案完全满足您的需求，且具有生产级质量！
+
+
+问题分析与优化方案
+问题1：线程安全问题
+当前代码中确实存在潜在的线程安全问题：
+
+ConvertedData的构造：在并行流中创建对象是安全的，但Key的生成需要保证幂等性
+Map聚合：Collectors.groupingByConcurrent是线程安全的，但默认的Collectors.toList()不是
+上下文对象共享：ProcessContext在多线程中共享，需要保证线程安全
+
+问题2：内存管理问题
+
+大量临时对象：在转换过程中会创建大量临时对象
+数据堆积：所有数据源的数据都加载到内存中
+GC压力：频繁的对象创建和销毁
+
+完整优化方案
+1. 增强的ProcessContext（线程安全）
+package com.example.domain;
+
+import lombok.Data;
+import java.io.Serializable;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
+
+/**
+ * 线程安全的请求上下文对象
+ */
+@Data
+public class ThreadSafeProcessContext implements Serializable {
+    private static final long serialVersionUID = 1L;
+    
+    private final String requestId;
+    private final MetricQueryVO queryVO;
+    private volatile Metadata metadata;
+    private final Long startTime;
+    
+    /** 线程安全的扩展属性 */
+    private final ConcurrentHashMap<String, Object> attributes;
+    
+    /** 统计信息 */
+    private final AtomicLong processedRecords;
+    private final AtomicLong filteredRecords;
+    
+    public ThreadSafeProcessContext(String requestId, MetricQueryVO queryVO) {
+        this.requestId = requestId;
+        this.queryVO = queryVO;
+        this.startTime = System.currentTimeMillis();
+        this.attributes = new ConcurrentHashMap<>();
+        this.processedRecords = new AtomicLong(0);
+        this.filteredRecords = new AtomicLong(0);
+    }
+    
+    /**
+     * 线程安全地设置属性
+     */
+    public void setAttribute(String key, Object value) {
+        attributes.put(key, value);
+    }
+    
+    /**
+     * 线程安全地获取属性
+     */
+    @SuppressWarnings("unchecked")
+    public <T> T getAttribute(String key) {
+        return (T) attributes.get(key);
+    }
+    
+    /**
+     * 原子增加处理记录数
+     */
+    public long incrementProcessed(long delta) {
+        return processedRecords.addAndGet(delta);
+    }
+    
+    /**
+     * 原子增加过滤记录数
+     */
+    public long incrementFiltered(long delta) {
+        return filteredRecords.addAndGet(delta);
+    }
+}
+
+2. 内存优化的数据处理管道
+package com.example.pipeline;
+
+import com.example.converter.IDataConverter;
+import com.example.datasource.IDataSource;
+import com.example.domain.ThreadSafeProcessContext;
+import com.example.filter.IDataFilter;
+import lombok.extern.slf4j.Slf4j;
+
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.stream.Collectors;
+
+/**
+ * 内存优化的数据处理管道
+ */
+@Slf4j
+public class MemoryOptimizedPipeline<T> {
+    
+    private static final int BATCH_SIZE = 500; // 批处理大小
+    private static final int MAX_QUEUE_SIZE = 2000; // 最大队列大小
+    
+    private final IDataSource<T> dataSource;
+    private final List<IDataFilter<T>> filters;
+    private final IDataConverter<T> converter;
+    private final ThreadSafeProcessContext context;
+    private final ITaskExecutorService taskExecutor;
+    
+    public MemoryOptimizedPipeline(IDataSource<T> dataSource,
+                                   List<IDataFilter<T>> filters,
+                                   IDataConverter<T> converter,
+                                   ThreadSafeProcessContext context,
+                                   ITaskExecutorService taskExecutor) {
+        this.dataSource = dataSource;
+        this.filters = filters;
+        this.converter = converter;
+        this.context = context;
+        this.taskExecutor = taskExecutor;
+    }
+    
+    /**
+     * 执行管道处理（流式处理，减少内存占用）
+     */
+    public BlockingQueue<IDataConverter.ConvertedData> executeStreaming() {
+        log.info("开始流式处理数据管道: {}", dataSource.getSourceName());
+        
+        // 使用有界队列，避免内存溢出
+        BlockingQueue<IDataConverter.ConvertedData> resultQueue = 
+                new LinkedBlockingQueue<>(MAX_QUEUE_SIZE);
+        
+        try {
+            if (!dataSource.needPagination()) {
+                // 不分页：批量处理
+                processBatch(dataSource.queryAll(context), resultQueue);
+            } else {
+                // 分页：流式处理
+                processWithPagination(resultQueue);
+            }
+            
+            // 添加结束标记
+            resultQueue.put(createEndMarker());
+            
+        } catch (Exception e) {
+            log.error("流式处理失败", e);
+            throw new RuntimeException("流式处理失败", e);
+        }
+        
+        return resultQueue;
+    }
+    
+    /**
+     * 分页流式处理
+     */
+    private void processWithPagination(BlockingQueue<IDataConverter.ConvertedData> resultQueue) 
+            throws Exception {
+        
+        // 1. 查询第一页
+        IDataSource.PageResult<T> firstPage = dataSource.queryFirstPage(context);
+        processBatch(firstPage.getData(), resultQueue);
+        
+        int totalPages = firstPage.getTotalPages(dataSource.getPageSize());
+        if (totalPages <= 1) {
+            return;
+        }
+        
+        // 2. 使用信号量控制并发度，避免OOM
+        Semaphore semaphore = new Semaphore(4); // 最多4个并发任务
+        CountDownLatch latch = new CountDownLatch(totalPages - 1);
+        
+        for (int page = 2; page <= totalPages; page++) {
+            final int currentPage = page;
+            
+            semaphore.acquire(); // 获取许可
+            
+            taskExecutor.submitTask(() -> {
+                try {
+                    List<T> pageData = dataSource.queryPage(context, currentPage);
+                    processBatch(pageData, resultQueue);
+                } catch (Exception e) {
+                    log.error("处理第{}页失败", currentPage, e);
+                } finally {
+                    semaphore.release(); // 释放许可
+                    latch.countDown();
+                }
+            }, "处理第" + currentPage + "页");
+        }
+        
+        // 等待所有页处理完成
+        latch.await(5, TimeUnit.MINUTES);
+    }
+    
+    /**
+     * 批量处理数据（避免一次性加载大量数据）
+     */
+    private void processBatch(List<T> rawData, BlockingQueue<IDataConverter.ConvertedData> resultQueue) 
+            throws InterruptedException {
+        
+        if (rawData == null || rawData.isEmpty()) {
+            return;
+        }
+        
+        // 分批处理，每批BATCH_SIZE条
+        for (int i = 0; i < rawData.size(); i += BATCH_SIZE) {
+            int end = Math.min(i + BATCH_SIZE, rawData.size());
+            List<T> batch = rawData.subList(i, end);
+            
+            // 过滤
+            List<T> filteredBatch = filterBatch(batch);
+            
+            // 转换
+            List<IDataConverter.ConvertedData> convertedBatch = convertBatch(filteredBatch);
+            
+            // 放入结果队列
+            for (IDataConverter.ConvertedData data : convertedBatch) {
+                resultQueue.put(data);
+            }
+            
+            // 显式清理，帮助GC
+            batch.clear();
+            filteredBatch.clear();
+            convertedBatch.clear();
+        }
+        
+        // 清理原始数据
+        rawData.clear();
+    }
+    
+    /**
+     * 批量过滤
+     */
+    private List<T> filterBatch(List<T> batch) {
+        if (filters == null || filters.isEmpty()) {
+            return batch;
+        }
+        
+        String sourceName = dataSource.getSourceName();
+        
+        List<IDataFilter<T>> applicableFilters = filters.stream()
+                .filter(f -> f.isApplicable(sourceName, context))
+                .sorted(Comparator.comparingInt(IDataFilter::getPriority))
+                .collect(Collectors.toList());
+        
+        List<T> currentBatch = batch;
+        for (IDataFilter<T> filter : applicableFilters) {
+            currentBatch = filter.filter(currentBatch, context);
+        }
+        
+        context.incrementFiltered(batch.size() - currentBatch.size());
+        return currentBatch;
+    }
+    
+    /**
+     * 批量转换
+     */
+    private List<IDataConverter.ConvertedData> convertBatch(List<T> filteredBatch) {
+        if (converter == null || !converter.isApplicable(dataSource.getSourceName(), context)) {
+            return Collections.emptyList();
+        }
+        
+        List<IDataConverter.ConvertedData> result = filteredBatch.stream()
+                .map(data -> {
+                    try {
+                        return converter.convert(data, context);
+                    } catch (Exception e) {
+                        log.error("转换数据失败", e);
+                        return null;
+                    }
+                })
+                .filter(Objects::nonNull)
+                .collect(Collectors.toList());
+        
+        context.incrementProcessed(result.size());
+        return result;
+    }
+    
+    /**
+     * 创建结束标记
+     */
+    private IDataConverter.ConvertedData createEndMarker() {
+        IDataConverter.ConvertedData marker = new IDataConverter.ConvertedData();
+        marker.setPeriodId("__END__");
+        return marker;
+    }
+}
+
+3. 线程安全的结果聚合器
+package com.example.aggregator;
+
+import com.example.converter.IDataConverter;
+import com.example.domain.MeasureData;
+import com.example.domain.MeasureDataVO;
+import lombok.extern.slf4j.Slf4j;
+
+import java.util.*;
+import java.util.concurrent.*;
+
+/**
+ * 线程安全的结果聚合器
+ */
+@Slf4j
+public class ThreadSafeResultAggregator {
+    
+    /**
+     * 使用ConcurrentHashMap保证线程安全
+     * 第一层：periodId -> 第二层Map
+     * 第二层：mapKey -> List<MeasureData>
+     */
+    private final ConcurrentHashMap<String, ConcurrentHashMap<String, CopyOnWriteArrayList<MeasureData>>> 
+            aggregateMap = new ConcurrentHashMap<>();
+    
+    /**
+     * 统计信息
+     */
+    private final AtomicLong totalRecords = new AtomicLong(0);
+    private final AtomicLong duplicateKeys = new AtomicLong(0);
+    
+    /**
+     * 添加转换后的数据（线程安全）
+     */
+    public void add(IDataConverter.ConvertedData data) {
+        if (data == null || "__END__".equals(data.getPeriodId())) {
+            return;
+        }
+        
+        String periodId = data.getPeriodId();
+        String mapKey = data.getMapKey();
+        MeasureData measureData = data.getMeasureData();
+        
+        // 获取或创建period级别的Map
+        ConcurrentHashMap<String, CopyOnWriteArrayList<MeasureData>> periodMap = 
+                aggregateMap.computeIfAbsent(periodId, k -> new ConcurrentHashMap<>());
+        
+        // 获取或创建mapKey对应的List
+        CopyOnWriteArrayList<MeasureData> dataList = 
+                periodMap.computeIfAbsent(mapKey, k -> new CopyOnWriteArrayList<>());
+        
+        // 添加数据
+        dataList.add(measureData);
+        
+        totalRecords.incrementAndGet();
+        
+        if (dataList.size() > 1) {
+            duplicateKeys.incrementAndGet();
+        }
+    }
+    
+    /**
+     * 批量添加（优化性能）
+     */
+    public void addBatch(List<IDataConverter.ConvertedData> dataList) {
+        if (dataList == null || dataList.isEmpty()) {
+            return;
+        }
+        
+        // 按periodId分组，减少锁竞争
+        Map<String, List<IDataConverter.ConvertedData>> groupedByPeriod = 
+                dataList.stream()
+                .filter(d -> d != null && !"__END__".equals(d.getPeriodId()))
+                .collect(Collectors.groupingBy(IDataConverter.ConvertedData::getPeriodId));
+        
+        groupedByPeriod.forEach((periodId, periodDataList) -> {
+            ConcurrentHashMap<String, CopyOnWriteArrayList<MeasureData>> periodMap = 
+                    aggregateMap.computeIfAbsent(periodId, k -> new ConcurrentHashMap<>());
+            
+            periodDataList.forEach(data -> {
+                String mapKey = data.getMapKey();
+                CopyOnWriteArrayList<MeasureData> list = 
+                        periodMap.computeIfAbsent(mapKey, k -> new CopyOnWriteArrayList<>());
+                list.add(data.getMeasureData());
+            });
+        });
+        
+        totalRecords.addAndGet(dataList.size());
+    }
+    
+    /**
+     * 获取聚合结果
+     */
+    public List<MeasureDataVO> getResult() {
+        log.info("开始构建最终结果，总记录数: {}, 重复Key数: {}", 
+                totalRecords.get(), duplicateKeys.get());
+        
+        List<MeasureDataVO> result = new ArrayList<>(aggregateMap.size());
+        
+        aggregateMap.forEach((periodId, periodMap) -> {
+            MeasureDataVO vo = new MeasureDataVO();
+            vo.setPeriodId(periodId);
+            
+            // 转换为普通HashMap（不再需要并发访问）
+            Map<String, List<MeasureData>> dataMap = new HashMap<>(periodMap.size());
+            periodMap.forEach((key, value) -> {
+                // 去重和优化
+                dataMap.put(key, optimizeMeasureList(value));
+            });
+            
+            vo.setDataMap(dataMap);
+            result.add(vo);
+        });
+        
+        // 清理内存
+        clear();
+        
+        log.info("最终结果构建完成，会计期数: {}", result.size());
+        return result;
+    }
+    
+    /**
+     * 优化度量列表（去重、排序）
+     */
+    private List<MeasureData> optimizeMeasureList(List<MeasureData> measures) {
+        if (measures.size() == 1) {
+            return new ArrayList<>(measures);
+        }
+        
+        // 去重（根据measureCode）
+        Map<String, MeasureData> uniqueMap = new LinkedHashMap<>();
+        for (MeasureData measure : measures) {
+            uniqueMap.putIfAbsent(measure.getMeasureCode(), measure);
+        }
+        
+        return new ArrayList<>(uniqueMap.values());
+    }
+    
+    /**
+     * 清理内存
+     */
+    public void clear() {
+        aggregateMap.clear();
+        totalRecords.set(0);
+        duplicateKeys.set(0);
+    }
+    
+    /**
+     * 获取统计信息
+     */
+    public Map<String, Object> getStatistics() {
+        Map<String, Object> stats = new HashMap<>();
+        stats.put("totalRecords", totalRecords.get());
+        stats.put("duplicateKeys", duplicateKeys.get());
+        stats.put("periodCount", aggregateMap.size());
+        return stats;
+    }
+}
+
+4. 内存优化的协调器
+package com.example.orchestrator;
+
+import com.example.converter.IDataConverter;
+import com.example.domain.MeasureDataVO;
+import com.example.domain.MetricQueryVO;
+import com.example.domain.ThreadSafeProcessContext;
+import com.example.aggregator.ThreadSafeResultAggregator;
+import com.example.pipeline.MemoryOptimizedPipeline;
+import com.example.pipeline.PipelineConfig;
+import com.example.service.MetadataLoader;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Component;
+
+import java.util.*;
+import java.util.concurrent.*;
+
+/**
+ * 内存优化的管道协调器
+ */
+@Slf4j
+@Component
+public class MemoryOptimizedOrchestrator {
+    
+    @Autowired
+    private MetadataLoader metadataLoader;
+    
+    @Autowired
+    private ITaskExecutorService taskExecutor;
+    
+    @Autowired
+    private PipelineConfigFactory configFactory;
+    
+    /**
+     * 执行多管道处理（内存优化版）
+     */
+    public List<MeasureDataVO> executeWithMemoryOptimization(MetricQueryVO queryVO) {
+        log.info("开始执行多管道处理（内存优化版）");
+        long startTime = System.currentTimeMillis();
+        
+        // 1. 构建线程安全的上下文
+        ThreadSafeProcessContext context = new ThreadSafeProcessContext(
+                UUID.randomUUID().toString(), 
+                queryVO
+        );
+        
+        // 2. 加载元数据
+        context.setMetadata(metadataLoader.loadMetadata(queryVO));
+        
+        // 3. 构建管道配置
+        List<PipelineConfig> pipelineConfigs = configFactory.buildConfigs(context);
+        
+        // 4. 创建线程安全的结果聚合器
+        ThreadSafeResultAggregator aggregator = new ThreadSafeResultAggregator();
+        
+        // 5. 启动所有管道（流式处理）
+        List<CompletableFuture<Void>> futures = new ArrayList<>();
+        
+        for (PipelineConfig config : pipelineConfigs) {
+            CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
+                try {
+                    processPipelineStreaming(config, context, aggregator);
+                } catch (Exception e) {
+                    log.error("管道处理失败: {}", config.getDataSource().getSourceName(), e);
+                }
+            }, taskExecutor.findExecutorService());
+            
+            futures.add(future);
+        }
+        
+        // 6. 等待所有管道完成
+        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+        
+        // 7. 获取聚合结果
+        List<MeasureDataVO> result = aggregator.getResult();
+        
+        long duration = System.currentTimeMillis() - startTime;
+        log.info("多管道处理完成，总耗时: {}ms, 处理记录: {}, 过滤记录: {}, 结果数: {}",
+                duration, context.getProcessedRecords(), context.getFilteredRecords(), result.size());
+        
+        // 8. 打印统计信息
+        printMemoryUsage();
+        
+        return result;
+    }
+    
+    /**
+     * 流式处理单个管道
+     */
+    private void processPipelineStreaming(PipelineConfig config, 
+                                         ThreadSafeProcessContext context,
+                                         ThreadSafeResultAggregator aggregator) {
+        
+        MemoryOptimizedPipeline pipeline = new MemoryOptimizedPipeline(
+                config.getDataSource(),
+                config.getFilters(),
+                config.getConverter(),
+                context,
+                taskExecutor
+        );
+        
+        // 获取结果队列
+        BlockingQueue<IDataConverter.ConvertedData> resultQueue = pipeline.executeStreaming();
+        
+        // 消费结果队列
+        List<IDataConverter.ConvertedData> batch = new ArrayList<>(100);
+        
+        try {
+            while (true) {
+                IDataConverter.ConvertedData data = resultQueue.poll(100, TimeUnit.MILLISECONDS);
+                
+                if (data == null) {
+                    continue;
+                }
+                
+                // 检查结束标记
+                if ("__END__".equals(data.getPeriodId())) {
+                    if (!batch.isEmpty()) {
+                        aggregator.addBatch(batch);
+                        batch.clear();
+                    }
+                    break;
+                }
+                
+                batch.add(data);
+                
+                // 批量添加到聚合器
+                if (batch.size() >= 100) {
+                    aggregator.addBatch(batch);
+                    batch.clear();
+                }
+            }
+        } catch (InterruptedException e) {
+            log.error("消费结果队列被中断", e);
+            Thread.currentThread().interrupt();
+        }
+    }
+    
+    /**
+     * 打印内存使用情况
+     */
+    private void printMemoryUsage() {
+        Runtime runtime = Runtime.getRuntime();
+        long totalMemory = runtime.totalMemory() / 1024 / 1024;
+        long freeMemory = runtime.freeMemory() / 1024 / 1024;
+        long usedMemory = totalMemory - freeMemory;
+        long maxMemory = runtime.maxMemory() / 1024 / 1024;
+        
+        log.info("内存使用情况 - 已用: {}MB, 空闲: {}MB, 总计: {}MB, 最大: {}MB",
+                usedMemory, freeMemory, totalMemory, maxMemory);
+    }
+}
+
+5. Key生成工具（保证线程安全和幂等性）
+package com.example.util;
+
+import com.google.common.hash.Hashing;
+import lombok.extern.slf4j.Slf4j;
+
+import java.nio.charset.StandardCharsets;
+import java.util.concurrent.ConcurrentHashMap;
+
+/**
+ * 线程安全的Key生成工具
+ */
+@Slf4j
+public class ThreadSafeKeyGenerator {
+    
+    /**
+     * Key缓存（避免重复计算）
+     */
+    private static final ConcurrentHashMap<String, String> KEY_CACHE = new ConcurrentHashMap<>();
+    
+    /**
+     * 生成Map的Key（线程安全，幂等）
+     * 
+     * @param metricCode 指标编码
+     * @param domainCode 领域编码
+     * @param measureCode 度量编码
+     * @return Map的Key
+     */
+    public static String generateMapKey(String metricCode, String domainCode, String measureCode) {
+        // 参数校验
+        if (metricCode == null || domainCode == null || measureCode == null) {
+            throw new IllegalArgumentException("Key参数不能为null");
+        }
+        
+        // 构建原始Key
+        String rawKey = metricCode + ":::" + domainCode + ":::" + measureCode;
+        
+        // 从缓存获取（减少字符串拼接）
+        return KEY_CACHE.computeIfAbsent(rawKey, k -> k);
+    }
+    
+    /**
+     * 生成Hash Key（用于缓存等场景）
+     */
+    public static String generateHashKey(String metricCode, String domainCode, String measureCode) {
+        String rawKey = metricCode + ":::" + domainCode + ":::" + measureCode;
+        
+        return Hashing.murmur3_128()
+                .hashString(rawKey, StandardCharsets.UTF_8)
+                .toString();
+    }
+    
+    /**
+     * 清理缓存（定时清理，避免内存泄漏）
+     */
+    public static void clearCache() {
+        int size = KEY_CACHE.size();
+        KEY_CACHE.clear();
+        log.info("清理Key缓存，清理数量: {}", size);
+    }
+    
+    /**
+     * 获取缓存大小
+     */
+    public static int getCacheSize() {
+        return KEY_CACHE.size();
+    }
+}
+
+6. 内存监控组件
+package com.example.monitor;
+
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Component;
+
+import javax.annotation.PostConstruct;
+import javax.annotation.PreDestroy;
+import java.lang.management.ManagementFactory;
+import java.lang.management.MemoryMXBean;
+import java.lang.management.MemoryUsage;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+
+/**
+ * 内存监控组件
+ */
+@Slf4j
+@Component
+public class MemoryMonitor {
+    
+    private ScheduledExecutorService scheduler;
+    private final MemoryMXBean memoryMXBean = ManagementFactory.getMemoryMXBean();
+    
+    /** 内存使用阈值（80%） */
+    private static final double MEMORY_THRESHOLD = 0.8;
+    
+    @PostConstruct
+    public void init() {
+        scheduler = Executors.newScheduledThreadPool(1);
+        
+        // 每30秒监控一次内存
+        scheduler.scheduleAtFixedRate(this::monitorMemory, 30, 30, TimeUnit.SECONDS);
+        
+        log.info("内存监控已启动");
+    }
+    
+    /**
+     * 监控内存使用情况
+     */
+    private void monitorMemory() {
+        try {
+            MemoryUsage heapUsage = memoryMXBean.getHeapMemoryUsage();
+            
+            long used = heapUsage.getUsed();
+            long max = heapUsage.getMax();
+            double usage = (double) used / max;
+            
+            long usedMB = used / 1024 / 1024;
+            long maxMB = max / 1024 / 1024;
+            
+            log.debug("堆内存使用: {}MB / {}MB ({}%)", usedMB, maxMB, String.format("%.2f", usage * 100));
+            
+            // 内存使用超过阈值，触发GC
+            if (usage > MEMORY_THRESHOLD) {
+                log.warn("内存使用超过阈值({}%)，触发GC", MEMORY_THRESHOLD * 100);
+                System.gc();
+            }
+            
+        } catch (Exception e) {
+            log.error("监控内存失败", e);
+        }
+    }
+    
+    /**
+     * 获取当前内存使用情况
+     */
+    public MemoryInfo getMemoryInfo() {
+        MemoryUsage heapUsage = memoryMXBean.getHeapMemoryUsage();
+        
+        MemoryInfo info = new MemoryInfo();
+        info.setUsed(heapUsage.getUsed() / 1024 / 1024);
+        info.setMax(heapUsage.getMax() / 1024 / 1024);
+        info.setCommitted(heapUsage.getCommitted() / 1024 / 1024);
+        info.setUsagePercent((double) heapUsage.getUsed() / heapUsage.getMax() * 100);
+        
+        return info;
+    }
+    
+    @PreDestroy
+    public void shutdown() {
+        if (scheduler != null) {
+            scheduler.shutdown();
+        }
+        log.info("内存监控已关闭");
+    }
+    
+    @lombok.Data
+    public static class MemoryInfo {
+        private long used;
+        private long max;
+        private long committed;
+        private double usagePercent;
+    }
+}
+
+7. 配置优化建议
+# application.yml
+
+# JVM参数建议（在启动脚本中设置）
+# -Xms2g -Xmx4g
+# -XX:+UseG1GC
+# -XX:MaxGCPauseMillis=200
+# -XX:+HeapDumpOnOutOfMemoryError
+# -XX:HeapDumpPath=/logs/heapdump.hprof
+
+# 线程池配置
+thread-pool:
+  core-size: 8  # 根据CPU核心数调整
+  max-size: 16
+  queue-capacity: 500  # 不要设置太大
+  keep-alive-seconds: 60
+
+# 批处理配置
+batch:
+  size: 500  # 每批处理的记录数
+  max-queue-size: 2000  # 队列最大大小
+  max-concurrent-tasks: 4  # 最大并发任务数
+
+# 内存监控配置
+memory:
+  monitor:
+    enabled: true
+    interval-seconds: 30
+    threshold-percent: 80
+    
+关键优化点总结
+线程安全保证
+
+? 使用ConcurrentHashMap代替HashMap
+? 使用CopyOnWriteArrayList代替ArrayList
+? 使用AtomicLong进行原子计数
+? Key生成使用缓存，
