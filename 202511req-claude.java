@@ -2253,4 +2253,454 @@ memory:
 ? 使用ConcurrentHashMap代替HashMap
 ? 使用CopyOnWriteArrayList代替ArrayList
 ? 使用AtomicLong进行原子计数
-? Key生成使用缓存，
+? Key生成使用缓存，避免重复计算
+5. ? 使用Semaphore控制并发度
+6. ? 所有共享状态都使用线程安全集合
+内存优化保证
+
+? 流式处理：不一次性加载所有数据
+? 批量处理：分批处理，及时释放
+? 有界队列：使用LinkedBlockingQueue限制队列大小
+? 显式清理：处理完立即clear()
+? 信号量控制：限制并发任务数
+? 内存监控：实时监控，超阈值触发GC
+
+完整使用示例
+8. Service层完整实现
+package com.example.service;
+
+import com.example.domain.MeasureDataVO;
+import com.example.domain.MetricQueryVO;
+import com.example.monitor.MemoryMonitor;
+import com.example.orchestrator.MemoryOptimizedOrchestrator;
+import com.example.util.ThreadSafeKeyGenerator;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
+
+import java.util.List;
+
+/**
+ * 业务服务实现（内存优化版）
+ */
+@Slf4j
+@Service
+public class OptimizedMetricDataService {
+    
+    @Autowired
+    private MemoryOptimizedOrchestrator orchestrator;
+    
+    @Autowired
+    private MemoryMonitor memoryMonitor;
+    
+    /**
+     * 查询度量数据（内存优化版）
+     */
+    public List<MeasureDataVO> queryMeasureData(MetricQueryVO queryVO) {
+        log.info("开始查询度量数据（内存优化版）");
+        
+        // 1. 检查内存状态
+        MemoryMonitor.MemoryInfo memoryBefore = memoryMonitor.getMemoryInfo();
+        log.info("查询前内存使用: {}MB / {}MB ({}%)", 
+                memoryBefore.getUsed(), memoryBefore.getMax(), 
+                String.format("%.2f", memoryBefore.getUsagePercent()));
+        
+        long startTime = System.currentTimeMillis();
+        
+        try {
+            // 2. 执行查询
+            List<MeasureDataVO> result = orchestrator.executeWithMemoryOptimization(queryVO);
+            
+            // 3. 统计信息
+            long duration = System.currentTimeMillis() - startTime;
+            log.info("查询完成，耗时: {}ms, 结果数: {}", duration, result.size());
+            
+            // 4. 检查内存状态
+            MemoryMonitor.MemoryInfo memoryAfter = memoryMonitor.getMemoryInfo();
+            log.info("查询后内存使用: {}MB / {}MB ({}%)", 
+                    memoryAfter.getUsed(), memoryAfter.getMax(), 
+                    String.format("%.2f", memoryAfter.getUsagePercent()));
+            
+            // 5. 清理Key缓存（定期清理）
+            if (ThreadSafeKeyGenerator.getCacheSize() > 10000) {
+                ThreadSafeKeyGenerator.clearCache();
+            }
+            
+            return result;
+            
+        } catch (Exception e) {
+            log.error("查询度量数据失败", e);
+            
+            // 失败时强制GC
+            System.gc();
+            
+            throw new RuntimeException("查询失败", e);
+        }
+    }
+}
+
+9. 测试类（验证线程安全和内存）
+package com.example.test;
+
+import com.example.aggregator.ThreadSafeResultAggregator;
+import com.example.converter.IDataConverter;
+import com.example.domain.MeasureData;
+import lombok.extern.slf4j.Slf4j;
+import org.junit.jupiter.api.Test;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+
+/**
+ * 线程安全和内存测试
+ */
+@Slf4j
+public class ConcurrencyAndMemoryTest {
+    
+    /**
+     * 测试并发写入的线程安全性
+     */
+    @Test
+    public void testConcurrentWrite() throws InterruptedException {
+        ThreadSafeResultAggregator aggregator = new ThreadSafeResultAggregator();
+        
+        int threadCount = 10;
+        int recordsPerThread = 1000;
+        
+        ExecutorService executor = Executors.newFixedThreadPool(threadCount);
+        CountDownLatch latch = new CountDownLatch(threadCount);
+        AtomicInteger errorCount = new AtomicInteger(0);
+        
+        for (int i = 0; i < threadCount; i++) {
+            final int threadId = i;
+            
+            executor.submit(() -> {
+                try {
+                    for (int j = 0; j < recordsPerThread; j++) {
+                        IDataConverter.ConvertedData data = createTestData(
+                                "2024Q" + (j % 4), 
+                                "M" + (j % 10), 
+                                "D" + (j % 5), 
+                                "MS" + (j % 3)
+                        );
+                        aggregator.add(data);
+                    }
+                } catch (Exception e) {
+                    log.error("线程{}写入失败", threadId, e);
+                    errorCount.incrementAndGet();
+                } finally {
+                    latch.countDown();
+                }
+            });
+        }
+        
+        latch.await(30, TimeUnit.SECONDS);
+        executor.shutdown();
+        
+        // 验证结果
+        log.info("并发写入测试完成");
+        log.info("统计信息: {}", aggregator.getStatistics());
+        log.info("错误数: {}", errorCount.get());
+        
+        assert errorCount.get() == 0 : "存在并发写入错误";
+        assert aggregator.getStatistics().get("totalRecords").equals(
+                (long) threadCount * recordsPerThread) : "记录数不匹配";
+    }
+    
+    /**
+     * 测试内存使用情况
+     */
+    @Test
+    public void testMemoryUsage() throws InterruptedException {
+        Runtime runtime = Runtime.getRuntime();
+        
+        // 记录初始内存
+        System.gc();
+        Thread.sleep(1000);
+        long memoryBefore = runtime.totalMemory() - runtime.freeMemory();
+        log.info("初始内存: {}MB", memoryBefore / 1024 / 1024);
+        
+        // 创建大量数据
+        ThreadSafeResultAggregator aggregator = new ThreadSafeResultAggregator();
+        
+        int totalRecords = 100000;
+        for (int i = 0; i < totalRecords; i++) {
+            IDataConverter.ConvertedData data = createTestData(
+                    "2024Q" + (i % 4), 
+                    "M" + (i % 100), 
+                    "D" + (i % 50), 
+                    "MS" + (i % 10)
+            );
+            aggregator.add(data);
+            
+            // 每1000条记录检查一次内存
+            if (i % 1000 == 0) {
+                long currentMemory = runtime.totalMemory() - runtime.freeMemory();
+                log.debug("处理{}条记录，内存: {}MB", i, currentMemory / 1024 / 1024);
+            }
+        }
+        
+        // 记录峰值内存
+        long memoryPeak = runtime.totalMemory() - runtime.freeMemory();
+        log.info("峰值内存: {}MB", memoryPeak / 1024 / 1024);
+        
+        // 获取结果
+        List<com.example.domain.MeasureDataVO> result = aggregator.getResult();
+        log.info("结果数量: {}", result.size());
+        
+        // GC后检查内存
+        System.gc();
+        Thread.sleep(1000);
+        long memoryAfter = runtime.totalMemory() - runtime.freeMemory();
+        log.info("GC后内存: {}MB", memoryAfter / 1024 / 1024);
+        
+        // 验证内存增长是否在合理范围内
+        long memoryGrowth = memoryAfter - memoryBefore;
+        log.info("内存增长: {}MB", memoryGrowth / 1024 / 1024);
+        
+        assert memoryGrowth < 500 * 1024 * 1024 : "内存增长超过500MB";
+    }
+    
+    /**
+     * 批量写入性能测试
+     */
+    @Test
+    public void testBatchPerformance() {
+        ThreadSafeResultAggregator aggregator = new ThreadSafeResultAggregator();
+        
+        int batchSize = 1000;
+        int batchCount = 100;
+        
+        // 测试批量添加
+        long startBatch = System.currentTimeMillis();
+        for (int i = 0; i < batchCount; i++) {
+            List<IDataConverter.ConvertedData> batch = new ArrayList<>();
+            for (int j = 0; j < batchSize; j++) {
+                batch.add(createTestData("2024Q1", "M" + j, "D" + j, "MS" + j));
+            }
+            aggregator.addBatch(batch);
+        }
+        long batchTime = System.currentTimeMillis() - startBatch;
+        
+        aggregator.clear();
+        
+        // 测试单条添加
+        long startSingle = System.currentTimeMillis();
+        for (int i = 0; i < batchCount * batchSize; i++) {
+            aggregator.add(createTestData("2024Q1", "M" + i, "D" + i, "MS" + i));
+        }
+        long singleTime = System.currentTimeMillis() - startSingle;
+        
+        log.info("批量添加耗时: {}ms", batchTime);
+        log.info("单条添加耗时: {}ms", singleTime);
+        log.info("性能提升: {}%", (singleTime - batchTime) * 100.0 / singleTime);
+        
+        assert batchTime < singleTime : "批量添加应该更快";
+    }
+    
+    /**
+     * 创建测试数据
+     */
+    private IDataConverter.ConvertedData createTestData(String periodId, 
+                                                        String metricCode,
+                                                        String domainCode, 
+                                                        String measureCode) {
+        IDataConverter.ConvertedData data = new IDataConverter.ConvertedData();
+        data.setPeriodId(periodId);
+        data.setMetricCode(metricCode);
+        data.setDomainCode(domainCode);
+        data.setMeasureCode(measureCode);
+        
+        MeasureData measureData = new MeasureData();
+        measureData.setMeasureCode(measureCode);
+        measureData.setValue("100.00");
+        measureData.setMeasureUnit("元");
+        measureData.setCurrency("CNY");
+        
+        data.setMeasureData(measureData);
+        
+        return data;
+    }
+}
+
+10. 性能监控AOP
+package com.example.aspect;
+
+import com.example.monitor.MemoryMonitor;
+import lombok.extern.slf4j.Slf4j;
+import org.aspectj.lang.ProceedingJoinPoint;
+import org.aspectj.lang.annotation.Around;
+import org.aspectj.lang.annotation.Aspect;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Component;
+
+/**
+ * 性能监控切面
+ */
+@Slf4j
+@Aspect
+@Component
+public class PerformanceMonitorAspect {
+    
+    @Autowired
+    private MemoryMonitor memoryMonitor;
+    
+    @Around("@annotation(com.example.annotation.MonitorPerformance)")
+    public Object monitorPerformance(ProceedingJoinPoint joinPoint) throws Throwable {
+        String methodName = joinPoint.getSignature().getName();
+        
+        // 记录开始时间和内存
+        long startTime = System.currentTimeMillis();
+        MemoryMonitor.MemoryInfo memoryBefore = memoryMonitor.getMemoryInfo();
+        
+        Object result = null;
+        try {
+            result = joinPoint.proceed();
+            return result;
+        } finally {
+            // 记录结束时间和内存
+            long duration = System.currentTimeMillis() - startTime;
+            MemoryMonitor.MemoryInfo memoryAfter = memoryMonitor.getMemoryInfo();
+            
+            long memoryUsed = memoryAfter.getUsed() - memoryBefore.getUsed();
+            
+            log.info("性能监控 - 方法: {}, 耗时: {}ms, 内存增长: {}MB", 
+                    methodName, duration, memoryUsed);
+            
+            // 如果耗时超过阈值，记录警告
+            if (duration > 5000) {
+                log.warn("方法{}执行缓慢，耗时: {}ms", methodName, duration);
+            }
+            
+            // 如果内存增长过大，记录警告
+            if (memoryUsed > 100) {
+                log.warn("方法{}内存增长较大: {}MB", methodName, memoryUsed);
+            }
+        }
+    }
+}
+
+/**
+ * 性能监控注解
+ */
+@Target(ElementType.METHOD)
+@Retention(RetentionPolicy.RUNTIME)
+public @interface MonitorPerformance {
+}
+
+11. 最佳实践建议文档
+/**
+ * ============================================
+ * 线程安全和内存优化最佳实践
+ * ============================================
+ * 
+ * 一、线程安全保证
+ * 
+ * 1. 共享状态必须使用线程安全集合
+ *    - ConcurrentHashMap：替代HashMap
+ *    - CopyOnWriteArrayList：替代ArrayList（读多写少）
+ *    - Collections.synchronizedXXX：同步包装器
+ * 
+ * 2. 计数器使用原子类
+ *    - AtomicLong：原子长整型
+ *    - AtomicInteger：原子整型
+ *    - LongAdder：高并发场景下的累加器
+ * 
+ * 3. 并发控制
+ *    - Semaphore：限制并发数
+ *    - CountDownLatch：等待多个线程完成
+ *    - CompletableFuture：异步编程
+ * 
+ * 4. 避免共享可变状态
+ *    - 尽量使用不可变对象
+ *    - 方法内局部变量线程安全
+ *    - ThreadLocal：线程本地变量
+ * 
+ * 二、内存优化策略
+ * 
+ * 1. 流式处理（最重要）
+ *    - 不要一次性加载所有数据到内存
+ *    - 使用BlockingQueue在生产者消费者之间传递数据
+ *    - 处理完一批数据立即释放
+ * 
+ * 2. 批量处理
+ *    - 分批处理大数据集
+ *    - 每批处理完显式调用clear()
+ *    - 建议批大小：500-1000条
+ * 
+ * 3. 使用有界队列
+ *    - LinkedBlockingQueue(capacity)
+ *    - 防止内存无限增长
+ *    - 背压机制：队列满时阻塞
+ * 
+ * 4. 并发度控制
+ *    - 使用Semaphore限制并发任务数
+ *    - 不要无限制创建线程
+ *    - 建议并发度：CPU核心数 * 2
+ * 
+ * 5. 及时释放资源
+ *    - 处理完的集合调用clear()
+ *    - 大对象使用完置null
+ *    - try-finally确保资源释放
+ * 
+ * 6. 对象复用
+ *    - 使用对象池
+ *    - 缓存频繁创建的对象
+ *    - StringBuilder复用
+ * 
+ * 三、监控和诊断
+ * 
+ * 1. 内存监控
+ *    - 定期检查堆内存使用率
+ *    - 超过阈值(80%)时触发GC
+ *    - 记录内存使用趋势
+ * 
+ * 2. 性能监控
+ *    - 记录方法执行时间
+ *    - 记录处理数据量
+ *    - 统计线程池使用情况
+ * 
+ * 3. GC调优
+ *    - 使用G1GC：-XX:+UseG1GC
+ *    - 设置最大停顿时间：-XX:MaxGCPauseMillis=200
+ *    - 开启GC日志：-Xlog:gc*
+ * 
+ * 四、常见问题和解决方案
+ * 
+ * 1. OutOfMemoryError
+ *    原因：一次性加载数据过多
+ *    解决：改用流式处理 + 批量处理
+ * 
+ * 2. ConcurrentModificationException
+ *    原因：并发修改非线程安全集合
+ *    解决：使用ConcurrentHashMap等线程安全集合
+ * 
+ * 3. 死锁
+ *    原因：多个线程互相等待锁
+ *    解决：统一锁顺序，使用tryLock(timeout)
+ * 
+ * 4. 内存泄漏
+ *    原因：集合持续增长不释放
+ *    解决：定期清理缓存，使用弱引用
+ * 
+ * 5. GC频繁
+ *    原因：大量临时对象创建
+ *    解决：对象复用，减少临时对象
+ * 
+ * 五、代码检查清单
+ * 
+ * □ 共享变量是否使用线程安全集合？
+ * □ 是否存在共享可变状态？
+ * □ 并发操作是否有适当的同步？
+ * □ 是否一次性加载大量数据？
+ * □ 大集合处理完是否调用clear()？
+ * □ 是否使用有界队列防止OOM？
+ * □ 并发度是否有控制？
+ * □ 是否有内存监控？
+ * □ 异常情况是否有资源清理？
+ * □ 是否有性能测试验证？
+ */
+ 
+ 
